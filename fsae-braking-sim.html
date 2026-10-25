@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FSAE 3D制动动力学与极限工况仿真台</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <style>
     :root {
       --bg-page: #050811;
@@ -282,6 +283,18 @@
       height: 100%;
       display: block;
     }
+    #simCanvas3D canvas { display: block; }
+    .webgl-fallback {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      color: #94a3b8;
+      text-align: center;
+      padding: 0 24px;
+    }
     .canvas-overlay-note {
       position: absolute;
       bottom: 10px;
@@ -476,11 +489,11 @@
     </div>
 
     <div class="canvas-container" id="stageBox">
-      <canvas id="simCanvas3D" width="960" height="430"></canvas>
+      <div id="simCanvas3D"></div>
       <div class="canvas-overlay-note">
-        <span><b style="color:#38bdf8;">↑ 蓝色矢量</b>: 地面法向反作用力 Fz</span>
-        <span><b style="color:#ef4444;">← 红色矢量</b>: 地面制动力 Fxb</span>
-        <span><b style="color:#ffffff;">● 轮胎白线</b>: 滚动轮速与锁死定格指示</span>
+        <span><b style="color:#38bdf8;">↑ 蓝色箭头</b>: 地面法向反作用力 Fz</span>
+        <span><b style="color:#ef4444;">← 红色箭头</b>: 地面制动力 Fxb</span>
+        <span><b style="color:#ffffff;">● 轮胎白点</b>: 滚动轮速与锁死定格指示</span>
       </div>
     </div>
   </div>
@@ -615,22 +628,8 @@ const sim = {
   smokes: []
 };
 
-const canvas3D = document.getElementById('simCanvas3D');
-const ctx3D = canvas3D.getContext('2d');
 const curveCanvas = document.getElementById('curveCanvas');
 const ctxCurve = curveCanvas.getContext('2d');
-
-function fitCanvases() {
-  const box = document.getElementById('stageBox');
-  if (box) {
-    const rect = box.getBoundingClientRect();
-    if (rect.width > 100 && rect.height > 100) {
-      canvas3D.width = Math.floor(rect.width);
-      canvas3D.height = Math.floor(rect.height);
-    }
-  }
-}
-window.addEventListener('resize', fitCanvases);
 
 // Pacejka 魔术公式连续滑移率曲线
 function tireMu(s) {
@@ -775,229 +774,453 @@ function stepSimulation(rawDt) {
   }
 }
 
-// ==================== 3. 3D 视窗渲染引擎 ====================
-function render3DStage() {
-  const W = canvas3D.width;
-  const H = canvas3D.height;
+// ==================== 3. Three.js 真实三维建模渲染引擎 ====================
+// 坐标映射: 世界X = 赛车前进方向, 世界Z = 侧向(sim.y), 车头朝本地 +X
+const R3D = {
+  renderer: null, scene: null, camera: null, dirLight: null,
+  carGroup: null, chassisGroup: null,
+  wheels: [],            // {steerG, spinG, tireMat, absDot}
+  fzArrows: [], fxArrows: [],
+  tireMatF: null, tireMatR: null,
+  skidPool: [], skidIdx: 0,
+  smokePool: [], lastSkidX: -10,
+  camTarget: null
+};
 
-  const bg = ctx3D.createLinearGradient(0, 0, 0, H);
-  bg.addColorStop(0, '#040814');
-  bg.addColorStop(0.5, '#091326');
-  bg.addColorStop(1, '#050a14');
-  ctx3D.fillStyle = bg;
-  ctx3D.fillRect(0, 0, W, H);
+function makeStripeTexture() {
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 16;
+  const g = c.getContext('2d');
+  g.fillStyle = '#dc2626'; g.fillRect(0, 0, 32, 16);
+  g.fillStyle = '#e2e8f0'; g.fillRect(32, 0, 32, 16);
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.repeat.set(420, 1);
+  return tex;
+}
 
-  const cx = W * 0.5;
-  const cy = H * (sim.cam === 'top' ? 0.52 : 0.56);
+function makeSmokeTexture() {
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 2, 32, 32, 30);
+  grad.addColorStop(0, 'rgba(235, 240, 245, 0.9)');
+  grad.addColorStop(0.5, 'rgba(200, 210, 220, 0.35)');
+  grad.addColorStop(1, 'rgba(200, 210, 220, 0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
 
-  let camDist = 4.8, camElev = 0.40, camAzim = 0;
-  if (sim.cam === 'side') {
-    camDist = 4.3; camElev = 0.08; camAzim = -Math.PI * 0.5;
-  } else if (sim.cam === 'top') {
-    camDist = 7.0; camElev = 1.48; camAzim = 0;
+function buildTrack(scene) {
+  // 大地
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(600, 220),
+    new THREE.MeshLambertMaterial({ color: 0x070b13 })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = -0.02;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  // 赛道沥青条
+  const asphalt = new THREE.Mesh(
+    new THREE.PlaneGeometry(600, 3.6),
+    new THREE.MeshLambertMaterial({ color: 0x101a2e })
+  );
+  asphalt.rotation.x = -Math.PI / 2;
+  asphalt.position.y = 0.0;
+  asphalt.receiveShadow = true;
+  scene.add(asphalt);
+
+  // 网格线
+  const grid = new THREE.GridHelper(600, 300, 0x1c2c4a, 0x101b30);
+  grid.material.transparent = true;
+  grid.material.opacity = 0.35;
+  grid.position.y = 0.015;
+  scene.add(grid);
+
+  // 红白路肩
+  const curbTex = makeStripeTexture();
+  [-1.925, 1.925].forEach(zPos => {
+    const curb = new THREE.Mesh(
+      new THREE.BoxGeometry(600, 0.035, 0.25),
+      new THREE.MeshLambertMaterial({ map: curbTex })
+    );
+    curb.position.set(0, 0.018, zPos);
+    curb.receiveShadow = true;
+    scene.add(curb);
+  });
+}
+
+function buildWing(w, h, d, color) {
+  const grp = new THREE.Group();
+  const plate = new THREE.Mesh(
+    new THREE.BoxGeometry(d, 0.022, w),
+    new THREE.MeshStandardMaterial({ color, metalness: 0.3, roughness: 0.5 })
+  );
+  plate.castShadow = true;
+  grp.add(plate);
+  [-w / 2, w / 2].forEach(z => {
+    const ep = new THREE.Mesh(
+      new THREE.BoxGeometry(d, h, 0.02),
+      new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.4, roughness: 0.5 })
+    );
+    ep.position.set(0, h / 2 - 0.01, z);
+    ep.castShadow = true;
+    grp.add(ep);
+  });
+  return grp;
+}
+
+function buildSuspensionArm(from, to, parent) {
+  const dir = new THREE.Vector3().subVectors(to, from);
+  const len = dir.length();
+  const mesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.012, 0.012, len, 6),
+    new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.6, roughness: 0.4 })
+  );
+  mesh.position.copy(from).add(to).multiplyScalar(0.5);
+  mesh.quaternion.setFromUnitVectors(
+    new THREE.Vector3(0, 1, 0),
+    dir.clone().normalize()
+  );
+  mesh.castShadow = true;
+  parent.add(mesh);
+}
+
+function buildCar(scene) {
+  R3D.carGroup = new THREE.Group();      // 整车: 平移 + 偏航
+  R3D.chassisGroup = new THREE.Group();  // 车身: 俯仰
+  R3D.carGroup.add(R3D.chassisGroup);
+  scene.add(R3D.carGroup);
+
+  const carbon = new THREE.MeshStandardMaterial({ color: 0x111827, metalness: 0.35, roughness: 0.55 });
+  const redMat = new THREE.MeshStandardMaterial({ color: 0xdc2626, metalness: 0.3, roughness: 0.45 });
+
+  function addBox(w, h, d, x, y, z, mat) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    m.position.set(x, y, z);
+    m.castShadow = true;
+    R3D.chassisGroup.add(m);
+    return m;
   }
 
-  function project(lx, ly, lz, withPitch = true) {
-    let x = lx, y = ly, z = lz;
-    if (withPitch) {
-      const cp = Math.cos(sim.pitch), sp = Math.sin(sim.pitch);
-      const ny = y * cp - z * sp;
-      const nz = y * sp + z * cp;
-      y = ny; z = nz;
-    }
-    const yawAngle = (sim.cam === 'side' ? 0 : sim.yaw * 0.3) + camAzim;
-    const cyw = Math.cos(yawAngle), syw = Math.sin(yawAngle);
-    const rx = x * cyw - y * syw;
-    const ry = x * syw + y * cyw;
+  // 单体壳车身 (车头 +X)
+  addBox(1.35, 0.10, 0.62, 0, 0.13, 0, carbon);                 // 底板
+  addBox(0.62, 0.20, 0.50, -0.05, 0.26, 0, carbon);             // 驾驶舱桶
+  const nose = addBox(0.55, 0.09, 0.26, 0.82, 0.16, 0, redMat); // 鼻锥
+  nose.scale.set(1, 1, 0.8);
+  addBox(0.30, 0.06, 0.14, 1.12, 0.17, 0, redMat);              // 鼻尖
 
-    const ce = Math.cos(camElev), se = Math.sin(camElev);
-    const yCam = ry * ce - z * se;
-    const zCam = ry * se + z * ce + camDist;
-    if (zCam < 0.25) return null;
-    const scale = (H * 0.88) / zCam;
-    return { x: cx + rx * scale, y: cy - yCam * scale, s: scale };
-  }
-
-  // 1) 赛道网格与红白路肩
-  const gridShift = (sim.x * 1.6) % 1.6;
-  ctx3D.strokeStyle = '#16243d';
-  ctx3D.lineWidth = 1;
-  for (let g = -8; g <= 8; g += 0.8) {
-    const p1 = project(-3.5, g - gridShift, -CAR.r, false);
-    const p2 = project(3.5, g - gridShift, -CAR.r, false);
-    if (p1 && p2) {
-      ctx3D.beginPath(); ctx3D.moveTo(p1.x, p1.y); ctx3D.lineTo(p2.x, p2.y); ctx3D.stroke();
-    }
-  }
-
-  [-1.75, 1.55].forEach(curbX => {
-    for (let s = -9; s <= 9; s += 0.8) {
-      const isRed = Math.abs(Math.floor((s - gridShift) * 1.25)) % 2 === 0;
-      const a = project(curbX, s - gridShift, -CAR.r, false);
-      const b = project(curbX + 0.25, s - gridShift, -CAR.r, false);
-      const c = project(curbX + 0.25, s + 0.72 - gridShift, -CAR.r, false);
-      const d = project(curbX, s + 0.72 - gridShift, -CAR.r, false);
-      if (a && b && c && d) {
-        ctx3D.fillStyle = isRed ? '#dc2626' : '#e2e8f0';
-        ctx3D.beginPath();
-        ctx3D.moveTo(a.x, a.y); ctx3D.lineTo(b.x, b.y);
-        ctx3D.lineTo(c.x, c.y); ctx3D.lineTo(d.x, d.y);
-        ctx3D.closePath(); ctx3D.fill();
-      }
-    }
+  // 侧箱
+  [0.36, -0.36].forEach(z => {
+    addBox(0.72, 0.17, 0.16, -0.12, 0.16, z, carbon);
   });
 
-  // 2) 地面黑胎印
-  sim.skids.forEach(sk => {
-    const dy = (sk.y - sim.y) - (sk.x - sim.x) * 0.4;
-    [-CAR.track * 0.48, CAR.track * 0.48].forEach(wx => {
-      const pt = project(wx, dy, -CAR.r, false);
-      if (pt) {
-        ctx3D.fillStyle = `rgba(10, 12, 18, ${sk.a * 0.65})`;
-        ctx3D.beginPath();
-        ctx3D.arc(pt.x, pt.y, Math.max(2, 3.2 * (pt.s / 130)), 0, Math.PI * 2);
-        ctx3D.fill();
-      }
-    });
+  // 车手头盔 + 转向盘
+  const helmet = new THREE.Mesh(
+    new THREE.SphereGeometry(0.115, 20, 16),
+    new THREE.MeshStandardMaterial({ color: 0xfbbf24, metalness: 0.15, roughness: 0.35 })
+  );
+  helmet.position.set(-0.05, 0.42, 0);
+  helmet.castShadow = true;
+  R3D.chassisGroup.add(helmet);
+  const wheelStub = addBox(0.04, 0.10, 0.20, 0.28, 0.34, 0,
+    new THREE.MeshStandardMaterial({ color: 0x0f172a }));
+  wheelStub.rotation.z = 0.5;
+
+  // 主环
+  const hoopBar = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.022, 0.022, 0.52, 8),
+    new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.7, roughness: 0.3 })
+  );
+  hoopBar.position.set(-0.32, 0.48, 0);
+  hoopBar.rotation.x = Math.PI / 2;
+  hoopBar.castShadow = true;
+  R3D.chassisGroup.add(hoopBar);
+  [-0.26, 0.26].forEach(z => {
+    const post = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.016, 0.016, 0.34, 8),
+      new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.7, roughness: 0.3 })
+    );
+    post.position.set(-0.32, 0.33, z);
+    post.castShadow = true;
+    R3D.chassisGroup.add(post);
   });
 
-  // 3) 赛车三维车体与空力套件
-  function poly(pts, fill, stroke) {
-    if (pts.some(p => !p)) return;
-    ctx3D.fillStyle = fill;
-    ctx3D.strokeStyle = stroke || '#0f172a';
-    ctx3D.lineWidth = 1.2;
-    ctx3D.beginPath();
-    ctx3D.moveTo(pts[0].x, pts[0].y);
-    for (let i = 1; i < pts.length; i++) ctx3D.lineTo(pts[i].x, pts[i].y);
-    ctx3D.closePath(); ctx3D.fill(); ctx3D.stroke();
-  }
+  // 前翼 (红色) / 尾翼 (蓝色, 带支柱)
+  const fWing = buildWing(1.24, 0.07, 0.30, 0xdc2626);
+  fWing.position.set(1.28, 0.085, 0);
+  R3D.chassisGroup.add(fWing);
 
-  poly([
-    project(-0.42, CAR.a + 0.2, -0.14),
-    project(0.42, CAR.a + 0.2, -0.14),
-    project(0.45, -CAR.b - 0.2, -0.14),
-    project(-0.45, -CAR.b - 0.2, -0.14)
-  ], '#0f172a', '#334155');
+  const rWing = buildWing(1.14, 0.14, 0.26, 0x0ea5e9);
+  rWing.position.set(-0.92, 0.60, 0);
+  R3D.chassisGroup.add(rWing);
+  [-0.18, 0.18].forEach(z => {
+    const pylon = new THREE.Mesh(
+      new THREE.BoxGeometry(0.05, 0.30, 0.03),
+      new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.5, roughness: 0.4 })
+    );
+    pylon.position.set(-0.92, 0.42, z);
+    pylon.castShadow = true;
+    R3D.chassisGroup.add(pylon);
+  });
 
-  const pNose = project(0, CAR.a + 0.58, -0.06);
-  const pFL   = project(-0.24, CAR.a, 0.06);
-  const pFR   = project(0.24, CAR.a, 0.06);
-  const pCL   = project(-0.36, 0.05, 0.22);
-  const pCR   = project(0.36, 0.05, 0.22);
-  const pRL   = project(-0.34, -CAR.b, 0.20);
-  const pRR   = project(0.34, -CAR.b, 0.20);
-
-  poly([pNose, pFL, pCL, pCR, pFR], '#dc2626', '#f87171');
-  poly([pCL, pCR, pRR, pRL], '#1e293b', '#475569');
-
-  const pHelmet = project(0, 0.02, 0.34);
-  if (pHelmet) {
-    ctx3D.fillStyle = '#fbbf24';
-    ctx3D.beginPath();
-    ctx3D.arc(pHelmet.x, pHelmet.y, Math.max(5, 8.5 * (pHelmet.s / 130)), 0, Math.PI * 2);
-    ctx3D.fill();
-  }
-
-  // 前后定风翼
-  poly([
-    project(-0.68, CAR.a + 0.52, -0.13),
-    project(0.68, CAR.a + 0.52, -0.13),
-    project(0.68, CAR.a + 0.34, -0.09),
-    project(-0.68, CAR.a + 0.34, -0.09)
-  ], 'rgba(239, 68, 68, 0.88)', '#fca5a5');
-
-  poly([
-    project(-0.62, -CAR.b - 0.12, 0.52),
-    project(0.62, -CAR.b - 0.12, 0.52),
-    project(0.62, -CAR.b - 0.38, 0.58),
-    project(-0.62, -CAR.b - 0.38, 0.58)
-  ], 'rgba(14, 165, 233, 0.88)', '#7dd3fc');
-
-  // 4) 四轮、轮胎白线与三维力矢量箭头
-  const wheelCoords = [
-    { id: 0, x: -CAR.track * 0.5, y: CAR.a, front: true },
-    { id: 1, x:  CAR.track * 0.5, y: CAR.a, front: true },
-    { id: 2, x: -CAR.track * 0.5, y: -CAR.b, front: false },
-    { id: 3, x:  CAR.track * 0.5, y: -CAR.b, front: false }
+  // 四轮 (转向组 > 自旋组 > 轮胎/轮毂/白点标记)
+  R3D.tireMatF = new THREE.MeshStandardMaterial({ color: 0x0b0f1a, roughness: 0.9 });
+  R3D.tireMatR = new THREE.MeshStandardMaterial({ color: 0x0b0f1a, roughness: 0.9 });
+  const wheelDefs = [
+    { x: CAR.a, z: 0.60, front: true },   // FL (左前, z+)
+    { x: CAR.a, z: -0.60, front: true },  // FR
+    { x: -CAR.b, z: 0.60, front: false }, // RL
+    { x: -CAR.b, z: -0.60, front: false } // RR
   ];
 
-  wheelCoords.forEach(w => {
-    const pC = project(w.x, w.y, 0);
-    const pB = project(w.x, w.y, -CAR.r);
-    if (!pC || !pB) return;
+  wheelDefs.forEach(def => {
+    const steerG = new THREE.Group();
+    steerG.position.set(def.x, CAR.r, def.z);
+    R3D.carGroup.add(steerG);
 
-    const rPix = Math.max(12, Math.hypot(pB.x - pC.x, pB.y - pC.y));
-    const steerAng = w.front ? (sim.steerDeg * Math.PI / 180) : 0;
+    const spinG = new THREE.Group();
+    steerG.add(spinG);
 
-    ctx3D.save();
-    ctx3D.translate(pC.x, pC.y);
+    const tire = new THREE.Mesh(
+      new THREE.CylinderGeometry(CAR.r, CAR.r, 0.17, 24),
+      def.front ? R3D.tireMatF : R3D.tireMatR
+    );
+    tire.rotation.x = Math.PI / 2;   // 轮轴指向侧向 Z
+    tire.castShadow = true;
+    spinG.add(tire);
 
-    ctx3D.fillStyle = '#0b1120';
-    ctx3D.strokeStyle = sim.slip[w.id] > 0.75 ? '#ef4444' : '#475569';
-    ctx3D.lineWidth = 2.2;
-    ctx3D.beginPath();
-    ctx3D.ellipse(0, 0, rPix * 0.58, rPix, steerAng * 0.35, 0, Math.PI * 2);
-    ctx3D.fill();
-    ctx3D.stroke();
+    const hub = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.095, 0.095, 0.175, 16),
+      new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.7, roughness: 0.35 })
+    );
+    hub.rotation.x = Math.PI / 2;
+    spinG.add(hub);
 
-    ctx3D.fillStyle = '#64748b';
-    ctx3D.beginPath();
-    ctx3D.ellipse(0, 0, rPix * 0.28, rPix * 0.48, steerAng * 0.35, 0, Math.PI * 2);
-    ctx3D.fill();
+    // 轮胎白色转速标记点 (抱死时定格)
+    [0.72, -0.72].forEach(f => {
+      const dot = new THREE.Mesh(
+        new THREE.BoxGeometry(0.05, 0.05, 0.02),
+        new THREE.MeshBasicMaterial({ color: 0xffffff })
+      );
+      dot.position.set(0, CAR.r * f, 0.095 * Math.sign(def.z));
+      spinG.add(dot);
+    });
 
-    // 醒目轮胎白色旋转标记线
-    const ang = sim.wheelAng[w.id];
-    const wx = Math.cos(ang) * (rPix * 0.52);
-    const wy = Math.sin(ang) * (rPix * 0.94);
-    ctx3D.strokeStyle = '#ffffff';
-    ctx3D.lineWidth = Math.max(2.6, rPix * 0.14);
-    ctx3D.beginPath();
-    ctx3D.moveTo(-wx * 0.3, -wy * 0.3);
-    ctx3D.lineTo(wx, wy);
-    ctx3D.stroke();
+    // ABS 点刹指示灯
+    const absDot = new THREE.Mesh(
+      new THREE.SphereGeometry(0.045, 10, 8),
+      new THREE.MeshBasicMaterial({ color: 0x10b981 })
+    );
+    absDot.position.set(0, CAR.r * 0.9, 0.1 * Math.sign(def.z));
+    absDot.visible = false;
+    steerG.add(absDot);
 
-    if (sim.absOn && sim.absPulsing) {
-      ctx3D.fillStyle = '#10b981';
-      ctx3D.beginPath();
-      ctx3D.arc(0, 0, rPix * 0.18, 0, Math.PI * 2);
-      ctx3D.fill();
-    }
-    ctx3D.restore();
+    R3D.wheels.push({ steerG, spinG, absDot, front: def.front });
 
-    // 地面法向力 Fz 蓝箭头
-    const fz = (w.front ? sim.Fz1 : sim.Fz2) * 0.5;
-    const fzLen = Math.min(80, (fz / 1400) * 40);
-    ctx3D.strokeStyle = '#38bdf8';
-    ctx3D.lineWidth = 2.5;
-    ctx3D.beginPath();
-    ctx3D.moveTo(pB.x, pB.y);
-    ctx3D.lineTo(pB.x, pB.y - fzLen);
-    ctx3D.stroke();
-
-    // 地面制动力 Fxb 红箭头
-    const fx = (w.front ? sim.Fx1 : sim.Fx2) * 0.5;
-    if (fx > 15) {
-      const fxLen = Math.min(75, (fx / 1400) * 42);
-      ctx3D.strokeStyle = '#ef4444';
-      ctx3D.lineWidth = 2.5;
-      ctx3D.beginPath();
-      ctx3D.moveTo(pB.x, pB.y);
-      ctx3D.lineTo(pB.x - fxLen * 0.6, pB.y + fxLen * 0.5);
-      ctx3D.stroke();
-    }
+    // 悬挂推杆
+    buildSuspensionArm(
+      new THREE.Vector3(def.x * 0.55, 0.16, def.z * 0.4),
+      new THREE.Vector3(def.x, CAR.r, def.z * 0.86),
+      R3D.carGroup
+    );
   });
 
-  // 5) 抱死白烟粒子
-  sim.smokes.forEach(sm => {
-    const pt = project(sm.lx, sm.ly, sm.lz, false);
-    if (pt) {
-      ctx3D.fillStyle = `rgba(226, 232, 240, ${sm.alpha * 0.42})`;
-      ctx3D.beginPath();
-      ctx3D.arc(pt.x, pt.y, sm.r * (pt.s / 130), 0, Math.PI * 2);
-      ctx3D.fill();
-    }
+  // 三维力矢量箭头: Fz 蓝色朝上, Fxb 红色朝后
+  wheelDefs.forEach(def => {
+    const fz = new THREE.ArrowHelper(
+      new THREE.Vector3(0, 1, 0),
+      new THREE.Vector3(def.x, 0.02, def.z), 1.0, 0x38bdf8, 0.16, 0.09
+    );
+    R3D.carGroup.add(fz);
+    R3D.fzArrows.push({ arrow: fz, front: def.front, x: def.x, z: def.z });
+
+    const fx = new THREE.ArrowHelper(
+      new THREE.Vector3(-1, 0, 0),
+      new THREE.Vector3(def.x, 0.05, def.z), 0.8, 0xef4444, 0.15, 0.09
+    );
+    fx.visible = false;
+    R3D.carGroup.add(fx);
+    R3D.fxArrows.push({ arrow: fx, front: def.front, x: def.x, z: def.z });
   });
+}
+
+function buildPools(scene) {
+  // 胎印池
+  const skidGeo = new THREE.PlaneGeometry(0.14, 0.42);
+  for (let i = 0; i < 240; i++) {
+    const m = new THREE.Mesh(skidGeo, new THREE.MeshBasicMaterial({
+      color: 0x04060b, transparent: true, opacity: 0.65, depthWrite: false
+    }));
+    m.rotation.x = -Math.PI / 2;
+    m.visible = false;
+    scene.add(m);
+    R3D.skidPool.push(m);
+  }
+  // 烟雾精灵池
+  const smokeTex = makeSmokeTexture();
+  for (let i = 0; i < 48; i++) {
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: smokeTex, transparent: true, opacity: 0, depthWrite: false
+    }));
+    sp.visible = false;
+    scene.add(sp);
+    R3D.smokePool.push(sp);
+  }
+}
+
+function initThree() {
+  const box = document.getElementById('stageBox');
+  const host = document.getElementById('simCanvas3D');
+
+  if (typeof THREE === 'undefined') {
+    host.innerHTML = '<div class="webgl-fallback">3D 引擎 (Three.js) 加载失败——预览和 GitHub Pages 需要联网；本地使用可将 three.min.js 下载后内联。</div>';
+    return false;
+  }
+
+  try {
+    R3D.renderer = new THREE.WebGLRenderer({ antialias: true });
+  } catch (e) {
+    host.innerHTML = '<div class="webgl-fallback">当前环境不支持 WebGL，无法渲染 3D 视窗。</div>';
+    return false;
+  }
+  R3D.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  R3D.renderer.setSize(box.clientWidth, box.clientHeight);
+  R3D.renderer.shadowMap.enabled = true;
+  R3D.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  host.appendChild(R3D.renderer.domElement);
+
+  R3D.scene = new THREE.Scene();
+  R3D.scene.background = new THREE.Color(0x040814);
+  R3D.scene.fog = new THREE.Fog(0x050a16, 32, 130);
+
+  R3D.camera = new THREE.PerspectiveCamera(55, box.clientWidth / box.clientHeight, 0.1, 400);
+  R3D.camera.position.set(-5.2, 1.9, 3);
+  R3D.camTarget = new THREE.Vector3(0, 0.4, 0);
+
+  R3D.scene.add(new THREE.HemisphereLight(0x3b4c6b, 0x0a0e18, 0.85));
+  R3D.dirLight = new THREE.DirectionalLight(0xffffff, 0.95);
+  R3D.dirLight.position.set(6, 12, 4);
+  R3D.dirLight.castShadow = true;
+  R3D.dirLight.shadow.mapSize.set(1024, 1024);
+  const sc = R3D.dirLight.shadow.camera;
+  sc.left = -7; sc.right = 7; sc.top = 7; sc.bottom = -7; sc.far = 40;
+  R3D.scene.add(R3D.dirLight);
+  R3D.scene.add(R3D.dirLight.target);
+
+  buildTrack(R3D.scene);
+  buildCar(R3D.scene);
+  buildPools(R3D.scene);
+  return true;
+}
+
+function fitCanvases() {
+  const box = document.getElementById('stageBox');
+  if (!box || !R3D.renderer) return;
+  const rect = box.getBoundingClientRect();
+  if (rect.width > 100 && rect.height > 100) {
+    R3D.renderer.setSize(Math.floor(rect.width), Math.floor(rect.height));
+    R3D.camera.aspect = rect.width / rect.height;
+    R3D.camera.updateProjectionMatrix();
+  }
+}
+window.addEventListener('resize', fitCanvases);
+
+const _v1 = new THREE.Vector3();
+const _v2 = new THREE.Vector3();
+const _colLock = new THREE.Color(0x7f1d1d);
+const _colFree = new THREE.Color(0x0b0f1a);
+
+function render3DStage(dt) {
+  if (!R3D.renderer) return;
+  const sF = 0.5 * (sim.slip[0] + sim.slip[1]);
+  const sR = 0.5 * (sim.slip[2] + sim.slip[3]);
+
+  // 整车位姿: 平移 + 偏航; 车身俯仰
+  R3D.carGroup.position.set(sim.x, 0, sim.y);
+  R3D.carGroup.rotation.y = -sim.yaw;
+  R3D.chassisGroup.rotation.z = -sim.pitch;
+
+  // 车轮: 转向 + 自旋 + 抱死发热变红 + ABS 灯
+  const steerRad = sim.steerDeg * Math.PI / 180;
+  R3D.wheels.forEach((w, i) => {
+    w.steerG.rotation.y = w.front ? -steerRad : 0;
+    w.spinG.rotation.z = -sim.wheelAng[i];
+    w.absDot.visible = sim.absOn && sim.absPulsing;
+  });
+  R3D.tireMatF.color.copy(_colFree).lerp(_colLock, Math.min(1, Math.max(0, (sF - 0.5) * 2.2)));
+  R3D.tireMatR.color.copy(_colFree).lerp(_colLock, Math.min(1, Math.max(0, (sR - 0.5) * 2.2)));
+
+  // 力矢量箭头长度
+  R3D.fzArrows.forEach(a => {
+    const fz = (a.front ? sim.Fz1 : sim.Fz2) * 0.5;
+    a.arrow.setLength(Math.max(0.06, Math.min(2.2, (fz / 1400) * 1.15)), 0.16, 0.09);
+  });
+  R3D.fxArrows.forEach(a => {
+    const fx = (a.front ? sim.Fx1 : sim.Fx2) * 0.5;
+    a.arrow.visible = fx > 40;
+    if (fx > 40) a.arrow.setLength(Math.max(0.08, Math.min(2.0, (fx / 1400) * 1.2)), 0.15, 0.09);
+  });
+
+  // 胎印 (按前进距离间隔落点)
+  if (sim.v > 1.0 && (sF > 0.35 || sR > 0.35) && sim.x - R3D.lastSkidX > 0.22) {
+    R3D.lastSkidX = sim.x;
+    const cy = Math.cos(-sim.yaw), sy = Math.sin(-sim.yaw);
+    [0.60, -0.60].forEach(lz => {
+      const m = R3D.skidPool[R3D.skidIdx % R3D.skidPool.length];
+      R3D.skidIdx++;
+      const lx = sF > sR ? CAR.a : -CAR.b;
+      // 本地(车头+X) -> 世界
+      m.position.set(sim.x + lx * cy + lz * sy, 0.025, sim.y - lx * sy + lz * cy);
+      m.rotation.z = -sim.yaw;
+      m.material.opacity = 0.35 + 0.4 * Math.max(sF, sR);
+      m.visible = true;
+    });
+  }
+
+  // 抱死烟雾
+  for (let i = 0; i < R3D.smokePool.length; i++) {
+    const sp = R3D.smokePool[i];
+    const sm = sim.smokes[i];
+    if (sm) {
+      const cy = Math.cos(-sim.yaw), sy = Math.sin(-sim.yaw);
+      sp.position.set(sim.x + sm.ly * cy + sm.lx * sy, CAR.r * 0.55, sim.y - sm.ly * sy + sm.lx * cy);
+      const sc = sm.r / 14;
+      sp.scale.set(sc, sc, sc);
+      sp.material.opacity = Math.max(0, sm.alpha * 0.5);
+      sp.visible = sm.alpha > 0;
+    } else {
+      sp.visible = false;
+    }
+  }
+
+  // 相机 (世界轴固定, 能观察到横摆自旋)
+  const cp = R3D.carGroup.position;
+  let desired, look;
+  if (sim.cam === 'side') {
+    desired = _v1.set(cp.x - 0.4, 0.85, cp.z + 5.2);
+    look = _v2.set(cp.x + 0.3, 0.35, cp.z);
+  } else if (sim.cam === 'top') {
+    desired = _v1.set(cp.x + 0.4, 8.6, cp.z + 1.4);
+    look = _v2.set(cp.x, 0, cp.z);
+  } else {
+    desired = _v1.set(cp.x - 5.4, 1.95, cp.z + 1.5);
+    look = _v2.set(cp.x + 1.6, 0.35, cp.z);
+  }
+  const k = 1 - Math.exp(-5.5 * dt);
+  R3D.camera.position.lerp(desired, k);
+  R3D.camTarget.lerp(look, k);
+  R3D.camera.lookAt(R3D.camTarget);
+
+  // 平行光跟随赛车 (保持阴影有效)
+  R3D.dirLight.position.set(cp.x + 6, 12, cp.z + 4);
+  R3D.dirLight.target.position.set(cp.x, 0, cp.z);
+  R3D.dirLight.target.updateMatrixWorld();
+
+  R3D.renderer.render(R3D.scene, R3D.camera);
 }
 
 // ==================== 4. I曲线与β线绘制 ====================
@@ -1175,6 +1398,8 @@ function resetVehicle() {
   sim.wheelOmega = [73.1, 73.1, 73.1, 73.1];
   sim.slip = [0, 0, 0, 0];
   sim.skids = []; sim.smokes = [];
+  R3D.skidPool.forEach(m => { m.visible = false; });
+  R3D.lastSkidX = -10;
   document.getElementById('slPedal').value = 0;
   document.getElementById('slSteer').value = 0;
   updatePedal(0);
@@ -1229,18 +1454,28 @@ function selectScenario(id) {
   }
 }
 
+let threeReady = false;
 function loop(now) {
   const dt = Math.min(0.05, Math.max(0.001, (now - lastTick) / 1000));
   lastTick = now;
   stepSimulation(dt);
-  render3DStage();
+  render3DStage(dt);
   renderCurves();
   refreshTelemetry();
   requestAnimationFrame(loop);
 }
 
+threeReady = initThree();
 fitCanvases();
 requestAnimationFrame(loop);
+
+// 看门狗: 某些内嵌视图/后台标签会停摆 requestAnimationFrame，
+// 检测到循环卡死时改用定时器驱动，保证仿真不冻结
+setInterval(() => {
+  if (performance.now() - lastTick > 400) {
+    loop(performance.now());
+  }
+}, 60);
 </script>
 </body>
 </html>
